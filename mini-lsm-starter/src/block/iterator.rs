@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use bytes::{buf, Buf};
 
-use crate::key::{KeySlice, KeyVec};
+use crate::key::{Key, KeySlice, KeyVec};
 
 use super::Block;
 
@@ -40,6 +40,13 @@ pub struct BlockIterator {
 impl Block {
     pub fn get_first_key(&self) -> KeyVec {
         let mut buf = &self.data[..];
+        let key_len = buf.get_u16();
+        let key = &buf[..key_len as usize];
+        KeyVec::from_vec(key.to_vec())
+    }
+    pub fn get_last_key(&self) -> KeyVec {
+        let last_key_offset = *self.offsets.last().unwrap();
+        let mut buf = &self.data[last_key_offset as usize..];
         let key_len = buf.get_u16();
         let key = &buf[..key_len as usize];
         KeyVec::from_vec(key.to_vec())
