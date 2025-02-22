@@ -17,9 +17,9 @@
 
 use std::sync::Arc;
 
-use bytes::{buf, Buf};
+use bytes::Buf;
 
-use crate::key::{Key, KeySlice, KeyVec};
+use crate::key::{KeySlice, KeyVec};
 
 use super::Block;
 
