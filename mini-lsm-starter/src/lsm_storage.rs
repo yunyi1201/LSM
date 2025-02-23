@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -38,7 +38,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -200,7 +200,12 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.flush_notifier.send(()).ok();
+        let mut flush_thread = self.flush_thread.lock();
+        if let Some(handle) = flush_thread.take() {
+            handle.join().map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        }
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -297,6 +302,9 @@ impl LsmStorageInner {
             ),
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
+        if !path.exists() {
+            std::fs::create_dir_all(path).context("failed to create DB directory")?;
+        }
 
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
@@ -435,7 +443,30 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        // let state_lock = self.state_lock.lock();
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+        if let Some(memtable) = snapshot.imm_memtables.last().cloned() {
+            let id = memtable.id();
+            let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+            // a lot IO operation, so need acquire `state_lock` to protect the only writer can into the critical section
+            // and allower the reader can concurrently read the key-value
+            memtable.flush(&mut sst_builder)?;
+            let sst =
+                sst_builder.build(id, Some(self.block_cache.clone()), self.path_of_sst(id))?;
+
+            {
+                let mut guard = self.state.write();
+                let mut snapshot = guard.as_ref().clone();
+                snapshot.imm_memtables.pop();
+                snapshot.l0_sstables.insert(0, id);
+                snapshot.sstables.insert(id, Arc::new(sst));
+                *guard = Arc::new(snapshot);
+            }
+        }
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
