@@ -178,6 +178,10 @@ fn range_overlap(
     true
 }
 
+fn key_within(user_key: &[u8], table_begin: KeySlice, table_end: KeySlice) -> bool {
+    table_begin.raw_ref() <= user_key && user_key <= table_end.raw_ref()
+}
+
 /// A thin wrapper for `LsmStorageInner` and the user interface for MiniLSM.
 pub struct MiniLsm {
     pub(crate) inner: Arc<LsmStorageInner>,
@@ -353,13 +357,24 @@ impl LsmStorageInner {
         }
 
         let mut l0_iters = Vec::with_capacity(snapshot.l0_sstables.len());
-
+        let keep_table = |key, table: &SsTable| {
+            if key_within(
+                key,
+                table.first_key().as_key_slice(),
+                table.last_key().as_key_slice(),
+            ) {
+                return true;
+            }
+            false
+        };
         for table_id in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables[table_id].clone();
-            l0_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
-                table,
-                KeySlice::from_slice(key),
-            )?));
+            if keep_table(key, &table) {
+                l0_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                    table,
+                    KeySlice::from_slice(key),
+                )?));
+            }
         }
         let l0_iter = MergeIterator::create(l0_iters);
         if l0_iter.is_valid() && l0_iter.key().raw_ref() == key && !l0_iter.value().is_empty() {
