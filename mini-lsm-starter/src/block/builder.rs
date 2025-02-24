@@ -21,6 +21,13 @@ use crate::key::{KeySlice, KeyVec};
 
 use super::Block;
 
+///----------------------------------Block encoding format--------------------------------------------------------------------------------
+/// --------------------------------------------------------------------------------------------------------------------------------------
+/// |                                     Entry                                        |             Entry Offsets     |  Offset numbers |
+/// --------------------------------------------------------------------------------------------------------------------------------------
+/// | key_overlap_len (u16) | rest_key_len (u16) | key | value_len (u16) | value | ... |  offset (u16) | offset (u16)  |       len       |
+/// --------------------------------------------------------------------------------------------------------------------------------------
+
 /// Builds a block.
 pub struct BlockBuilder {
     /// Offsets of each key-value entries.
@@ -31,6 +38,19 @@ pub struct BlockBuilder {
     block_size: usize,
     /// The first key in the block
     first_key: KeyVec,
+}
+fn compute_overlap(first_key: KeySlice, key: KeySlice) -> usize {
+    let mut i = 0;
+    loop {
+        if i >= first_key.len() || i >= key.len() {
+            break;
+        }
+        if first_key.raw_ref()[i] != key.raw_ref()[i] {
+            break;
+        }
+        i += 1;
+    }
+    i
 }
 
 impl BlockBuilder {
@@ -58,8 +78,10 @@ impl BlockBuilder {
         let offset = self.data.len() as u16;
         self.offsets.push(offset);
 
-        self.data.put_u16(key.len() as u16);
-        self.data.put(key.raw_ref());
+        let overlap = compute_overlap(self.first_key.as_key_slice(), key);
+        self.data.put_u16(overlap as u16);
+        self.data.put_u16((key.len() - overlap) as u16);
+        self.data.put(&key.raw_ref()[overlap..]);
         self.data.put_u16(value.len() as u16);
         self.data.put(value);
         if self.first_key.is_empty() {

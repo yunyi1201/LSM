@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use bytes::Buf;
 
-use crate::key::{KeySlice, KeyVec};
+use crate::key::{self, KeySlice, KeyVec};
 
 use super::Block;
 
@@ -40,6 +40,7 @@ pub struct BlockIterator {
 impl Block {
     pub fn get_first_key(&self) -> KeyVec {
         let mut buf = &self.data[..];
+        buf.get_u16();
         let key_len = buf.get_u16();
         let key = &buf[..key_len as usize];
         KeyVec::from_vec(key.to_vec())
@@ -66,12 +67,20 @@ impl BlockIterator {
 
     fn seek_to_offset(&mut self, offset: usize) {
         let mut buf = &self.block.data[offset..];
-        let key_len = buf.get_u16() as usize;
-        let key = &buf[..key_len];
-        self.key = KeyVec::from_vec(key.to_vec());
-        buf = &buf[key_len..];
+        let overlap_len = buf.get_u16() as usize;
+        let rest_key_len = buf.get_u16() as usize;
+        let rest_key = &buf[..rest_key_len];
+
+        self.key.clear();
+        self.key.append(&self.first_key.raw_ref()[..overlap_len]);
+        self.key.append(rest_key);
+        buf.advance(rest_key_len);
+
         let value_len = buf.get_u16() as usize;
-        self.value_range = (offset + key_len + 4, offset + key_len + 4 + value_len);
+        let value_offset_begin = offset + 2 + 2 + rest_key_len + 2;
+        let value_offset_end = value_offset_begin + value_len;
+        self.value_range = (value_offset_begin, value_offset_end);
+        buf.advance(value_len);
     }
 
     fn seek_to(&mut self, idx: usize) {
