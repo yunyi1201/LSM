@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::BufMut;
 
-use super::{BlockMeta, FileObject, SsTable};
+use super::{bloom::Bloom, BlockMeta, FileObject, SsTable};
 use crate::{
     block::BlockBuilder,
     key::{KeyBytes, KeySlice},
@@ -36,6 +36,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hashs: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -48,6 +49,7 @@ impl SsTableBuilder {
             data: vec![],
             meta: vec![],
             block_size,
+            key_hashs: vec![],
         }
     }
 
@@ -73,6 +75,7 @@ impl SsTableBuilder {
             self.first_key.extend(key.raw_ref());
         }
 
+        self.key_hashs.push(farmhash::fingerprint32(key.raw_ref()));
         if self.builder.add(key, value) {
             self.last_key.clear();
             self.last_key.extend(key.raw_ref());
@@ -106,7 +109,15 @@ impl SsTableBuilder {
         let mut buf = self.data;
         let meta_offset = buf.len();
         BlockMeta::encode_block_meta(&self.meta, &mut buf);
+        let bloom = Bloom::build_from_key_hashes(
+            &self.key_hashs,
+            Bloom::bloom_bits_per_key(self.key_hashs.len(), 0.01),
+        );
+        let bloom_offset = buf.len();
+        bloom.encode(&mut buf);
+
         buf.put_u32(meta_offset as u32);
+        buf.put_u32(bloom_offset as u32);
 
         let file = FileObject::create(path.as_ref(), buf)?;
         Ok(SsTable {
@@ -117,7 +128,7 @@ impl SsTableBuilder {
             block_meta: self.meta,
             block_meta_offset: meta_offset,
             block_cache,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0, // will be changed to latest ts in week 2
         })
     }

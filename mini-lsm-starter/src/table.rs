@@ -137,6 +137,13 @@ impl FileObject {
     }
 }
 
+///---------------------------------------------------------SST encoding format----------------------------------------------------------------
+/// -------------------------------------------------------------------------------------------------------------------------------------------
+/// |          Block Section        |          Meta Section        |   Bloom Filter    |                       Extra                          |
+/// -------------------------------------------------------------------------------------------------------------------------------------------
+/// | data block | ... | data block |  numbers(u32) | meta data    |   filter data     | meta block offset (u32) | filter block offset (u32)  |
+/// -------------------------------------------------------------------------------------------------------------------------------------------
+
 /// An SSTable.
 pub struct SsTable {
     /// The actual storage unit of SsTable, the format is as above.
@@ -165,7 +172,12 @@ impl SsTable {
         let buf = file.read(0, file.size())?;
         let len = file.size();
         let block_meta_offset =
+            (&buf.as_slice()[len as usize - 2 * std::mem::size_of::<u32>()..]).get_u32();
+        let block_filter_offset =
             (&buf.as_slice()[len as usize - std::mem::size_of::<u32>()..]).get_u32();
+        let bloom = Bloom::decode(
+            &buf[block_filter_offset as usize..(len as usize - 2 * std::mem::size_of::<u32>())],
+        )?;
         let block_meta = BlockMeta::decode_block_meta(&buf[block_meta_offset as usize..]);
 
         Ok(Self {
@@ -176,7 +188,7 @@ impl SsTable {
             block_meta,
             block_meta_offset: block_meta_offset as usize,
             block_cache,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }

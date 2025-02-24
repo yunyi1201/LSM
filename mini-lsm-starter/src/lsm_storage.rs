@@ -363,7 +363,13 @@ impl LsmStorageInner {
                 table.first_key().as_key_slice(),
                 table.last_key().as_key_slice(),
             ) {
-                return true;
+                if let Some(bloom) = table.bloom.as_ref() {
+                    if bloom.may_contain(farmhash::fingerprint32(key)) {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
             }
             false
         };
