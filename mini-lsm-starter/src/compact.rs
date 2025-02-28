@@ -37,6 +37,7 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -263,11 +264,11 @@ impl LsmStorageInner {
             let l1_sstables = state.levels[0].clone().1;
             (l0_sstables, l1_sstables)
         };
-
-        let ssts = self.compact(&CompactionTask::ForceFullCompaction {
+        let compaction_task = CompactionTask::ForceFullCompaction {
             l0_sstables: l0_to_compact.clone(),
             l1_sstables: l1_to_compact.clone(),
-        })?;
+        };
+        let ssts = self.compact(&compaction_task)?;
 
         let mut ids = Vec::with_capacity(ssts.len());
 
@@ -297,7 +298,11 @@ impl LsmStorageInner {
                 .collect::<Vec<_>>();
             assert!(l0_sstables_map.is_empty());
             *self.state.write() = Arc::new(snapshot);
-            // self.sync_dir()?;
+            self.sync_dir()?;
+            self.manifest.as_ref().unwrap().add_record(
+                &state_lock,
+                ManifestRecord::Compaction(compaction_task, ids.clone()),
+            )?;
         }
 
         for sst in l0_to_compact.iter().chain(l1_to_compact.iter()) {
@@ -307,6 +312,7 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    // only compaction thread can modifiy the `level` and `sstables` fields in the state.
     fn trigger_compaction(&self) -> Result<()> {
         let snapshot = {
             let state = self.state.read();
@@ -322,6 +328,11 @@ impl LsmStorageInner {
         println!("running compaction task: {:?}", task);
         let sstables = self.compact(&task)?;
         let output = sstables.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
+        // the whole operation should be read-and-modify atomic, so we need to lock the state.
+        // there have an data race between the compaction thread and the flush thread.
+        // so we need to lock the state when we update the state.
+        // 为了不影响读性能，选择了读写锁，这样在读的时候不会被阻塞。
+        // TODO (分析数据竞争)
         let ssts_to_remove = {
             let state_lock = self.state_lock.lock();
             let mut snapshot = self.state.read().as_ref().clone();
@@ -343,6 +354,11 @@ impl LsmStorageInner {
             let mut state = self.state.write();
             *state = Arc::new(snapshot);
             drop(state);
+            self.sync_dir()?;
+            self.manifest
+                .as_ref()
+                .unwrap()
+                .add_record(&state_lock, ManifestRecord::Compaction(task, new_sst_ids))?;
             ssts_to_remove
         };
         println!(
@@ -354,6 +370,7 @@ impl LsmStorageInner {
         for sst in ssts_to_remove {
             std::fs::remove_file(self.path_of_sst(sst.sst_id()))?;
         }
+        self.sync_dir()?;
         Ok(())
     }
 
@@ -383,15 +400,12 @@ impl LsmStorageInner {
     }
 
     fn trigger_flush(&self) -> Result<()> {
+        // only flush thread remove memtable from the imm_memtbales.
+        // so we just check the size of imm_memtables once.
         let guard = self.state.read();
         if guard.imm_memtables.len() >= self.options.num_memtable_limit {
             drop(guard);
-            let state_lock = self.state_lock.lock();
-            let guard = self.state.read();
-            if guard.imm_memtables.len() >= self.options.num_memtable_limit {
-                drop(guard);
-                self.force_flush_next_imm_memtable()?;
-            }
+            self.force_flush_next_imm_memtable()?;
         }
         Ok(())
     }
