@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::{fs::File, io::Write};
 
 use anyhow::{Context, Result};
-use bytes::{buf, Buf};
+use bytes::Buf;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 

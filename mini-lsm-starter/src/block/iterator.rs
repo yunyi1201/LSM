@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use bytes::Buf;
 
-use crate::key::{self, KeySlice, KeyVec};
+use crate::key::{KeySlice, KeyVec};
 
 use super::Block;
 

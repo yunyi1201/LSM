@@ -18,9 +18,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::ops::Bound;
-use std::os::macos::raw::stat;
 use std::path::{Path, PathBuf};
-use std::process::Output;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -224,21 +222,17 @@ impl MiniLsm {
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
-        // if self.inner.options.enable_wal {
-        //     self.inner.sync()?;
-        //     self.inner.sync_dir()?;
-        //     return Ok(());
-        // }
+        if self.inner.options.enable_wal {
+            self.inner.sync()?;
+            self.inner.sync_dir()?;
+            return Ok(());
+        }
 
         if !self.inner.state.read().memtable.is_empty() {
-            let mut guard = self.inner.state.write();
-            let mut snapshot = guard.as_ref().clone();
-
-            let new_memtable = MemTable::create(self.inner.next_sst_id());
-            let old_memtable = std::mem::replace(&mut snapshot.memtable, Arc::new(new_memtable));
-            snapshot.imm_memtables.insert(0, old_memtable.clone());
-            *guard = Arc::new(snapshot);
-            drop(guard);
+            self.inner
+                .freeze_memtable_with_memtable(Arc::new(MemTable::create(
+                    self.inner.next_sst_id(),
+                )))?;
         }
         while {
             let snapshot = self.inner.state.read();
@@ -352,22 +346,33 @@ impl LsmStorageInner {
 
         let manifest_path = path.join("MANIFEST");
         if !manifest_path.exists() {
+            if options.enable_wal {
+                state.memtable = Arc::new(MemTable::create_with_wal(
+                    state.memtable.id(),
+                    Self::path_of_wal_static(path, state.memtable.id()),
+                )?);
+            }
             manifest = Manifest::create(&manifest_path).context("failed to create manifest")?;
+            manifest.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
         } else {
             let (m, records) =
                 Manifest::recover(&manifest_path).context("failed to recover manifest")?;
-
+            let mut memtables = BTreeSet::new();
             for record in records {
                 match record {
                     ManifestRecord::Flush(sst_id) => {
+                        let res = memtables.remove(&sst_id);
+                        assert!(res, "memtable not exist?");
                         if compaction_controller.flush_to_l0() {
                             state.l0_sstables.insert(0, sst_id);
                         } else {
                             state.levels.insert(0, (sst_id, vec![sst_id]));
                         }
+                        next_sst_id = next_sst_id.max(sst_id);
                     }
-                    ManifestRecord::NewMemtable(_) => {
-                        todo!()
+                    ManifestRecord::NewMemtable(x) => {
+                        next_sst_id = next_sst_id.max(x);
+                        memtables.insert(x);
                     }
                     ManifestRecord::Compaction(task, output) => {
                         let (new_state, _) = compaction_controller
@@ -400,7 +405,25 @@ impl LsmStorageInner {
             next_sst_id += 1;
 
             // recover memtables
-            state.memtable = Arc::new(MemTable::create(next_sst_id));
+            if options.enable_wal {
+                let mut wal_cnt = 0;
+                for id in memtables.iter() {
+                    let memtable =
+                        MemTable::recover_from_wal(*id, Self::path_of_wal_static(path, *id))?;
+                    if !memtable.is_empty() {
+                        state.imm_memtables.insert(0, Arc::new(memtable));
+                        wal_cnt += 1;
+                    }
+                }
+                println!("{} WALS recovered", wal_cnt);
+                state.memtable = Arc::new(MemTable::create_with_wal(
+                    next_sst_id,
+                    Self::path_of_wal_static(path, next_sst_id),
+                )?);
+            } else {
+                state.memtable = Arc::new(MemTable::create(next_sst_id));
+            }
+            m.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
             next_sst_id += 1;
             manifest = m;
         }
@@ -422,7 +445,7 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        self.state.read().memtable.sync_wal()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -560,19 +583,36 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    /// Force freeze the current memtable to an immutable memtable
-    pub fn force_freeze_memtable(&self, state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        let memtable = MemTable::create(self.next_sst_id()); // may have IO operation
-        let mut guard = self.state.write(); // only one thread can modify the state
-        let mut snapshot = guard.as_ref().clone(); // clone the current state, so that to modify the state
-        let old_memtable = std::mem::replace(&mut snapshot.memtable, Arc::new(memtable));
-        snapshot.imm_memtables.insert(0, old_memtable);
-
-        // update the state (like RCU) 复制数据结构, 执行更新操作，然后更新指针
+    fn freeze_memtable_with_memtable(&self, memtable: Arc<MemTable>) -> Result<()> {
+        let mut guard = self.state.write();
+        let mut snapshot = guard.as_ref().clone();
+        let old_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
+        snapshot.imm_memtables.insert(0, old_memtable.clone());
         *guard = Arc::new(snapshot);
         drop(guard);
-        // self.manifest.as_ref().unwrap().add_record(state_lock_observer, ManifestRecord::NewMemtable())
+        old_memtable.sync_wal()?;
+        Ok(())
+    }
 
+    /// Force freeze the current memtable to an immutable memtable
+    pub fn force_freeze_memtable(&self, state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        let memtable_id = self.next_sst_id();
+        let memtable = if self.options.enable_wal {
+            Arc::new(MemTable::create_with_wal(
+                memtable_id,
+                self.path_of_wal(memtable_id),
+            )?)
+        } else {
+            Arc::new(MemTable::create(memtable_id))
+        }; // may have IO operation
+        self.freeze_memtable_with_memtable(memtable)?;
+
+        // update the state (like RCU) 复制数据结构, 执行更新操作，然后更新指针
+        self.manifest.as_ref().unwrap().add_record(
+            state_lock_observer,
+            ManifestRecord::NewMemtable(memtable_id),
+        )?;
+        self.sync_dir()?;
         Ok(())
     }
 
