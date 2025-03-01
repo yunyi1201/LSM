@@ -57,12 +57,15 @@ impl SsTableBuilder {
     fn finish_block(&mut self) {
         let builder = std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
         let encoded_block = builder.build().encode();
+
         self.meta.push(BlockMeta {
             offset: self.data.len(),
             first_key: KeyBytes::from_bytes(std::mem::take(&mut self.first_key).into()),
             last_key: KeyBytes::from_bytes(std::mem::take(&mut self.last_key).into()),
         });
+        let checksum = crc32fast::hash(&encoded_block.as_ref());
         self.data.extend(encoded_block);
+        self.data.put_u32(checksum);
     }
 
     /// Adds a key-value pair to SSTable.
@@ -109,6 +112,7 @@ impl SsTableBuilder {
         let mut buf = self.data;
         let meta_offset = buf.len();
         BlockMeta::encode_block_meta(&self.meta, &mut buf);
+        buf.put_u32(meta_offset as u32);
         let bloom = Bloom::build_from_key_hashes(
             &self.key_hashs,
             Bloom::bloom_bits_per_key(self.key_hashs.len(), 0.01),
@@ -116,7 +120,6 @@ impl SsTableBuilder {
         let bloom_offset = buf.len();
         bloom.encode(&mut buf);
 
-        buf.put_u32(meta_offset as u32);
         buf.put_u32(bloom_offset as u32);
 
         let file = FileObject::create(path.as_ref(), buf)?;

@@ -23,7 +23,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
@@ -66,7 +66,7 @@ impl BlockMeta {
             // The size of actual key
             estimated_size += meta.last_key.len();
         }
-
+        estimated_size += std::mem::size_of::<u32>();
         // Reserve the space to improve performance, especially when the size of incoming data is
         // large
         buf.reserve(estimated_size);
@@ -79,13 +79,15 @@ impl BlockMeta {
             buf.put_u16(meta.last_key.len() as u16);
             buf.put_slice(meta.last_key.raw_ref());
         }
+        buf.put_u32(crc32fast::hash(&buf[original_len + 4..]));
         assert_eq!(estimated_size, buf.len() - original_len);
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+    pub fn decode_block_meta(mut buf: &[u8]) -> Result<Vec<BlockMeta>> {
         let mut block_meta = Vec::new();
         let num = buf.get_u32() as usize;
+        let checksum = crc32fast::hash(&buf[..buf.remaining() - 4]);
         for _ in 0..num {
             let offset = buf.get_u32() as usize;
             let first_key_len = buf.get_u16() as usize;
@@ -98,7 +100,10 @@ impl BlockMeta {
                 last_key,
             });
         }
-        block_meta
+        if buf.get_u32() != checksum {
+            bail!("meta checksum mismatched");
+        }
+        Ok(block_meta)
     }
 }
 
@@ -171,14 +176,14 @@ impl SsTable {
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         let buf = file.read(0, file.size())?;
         let len = file.size();
-        let block_meta_offset =
-            (&buf.as_slice()[len as usize - 2 * std::mem::size_of::<u32>()..]).get_u32();
-        let block_filter_offset =
-            (&buf.as_slice()[len as usize - std::mem::size_of::<u32>()..]).get_u32();
-        let bloom = Bloom::decode(
-            &buf[block_filter_offset as usize..(len as usize - 2 * std::mem::size_of::<u32>())],
+        let bloom_filter_offset = (&buf.as_slice()[(len as usize - 4)..]).get_u32();
+        let block_meta_offset = (&buf.as_slice()
+            [(bloom_filter_offset as usize - 4)..bloom_filter_offset as usize])
+            .get_u32();
+        let block_meta = BlockMeta::decode_block_meta(
+            &buf[block_meta_offset as usize..bloom_filter_offset as usize - 4],
         )?;
-        let block_meta = BlockMeta::decode_block_meta(&buf[block_meta_offset as usize..]);
+        let bloom = Bloom::decode(&buf[bloom_filter_offset as usize..len as usize - 4])?;
 
         Ok(Self {
             first_key: block_meta.first().unwrap().first_key.clone(),
@@ -224,8 +229,12 @@ impl SsTable {
         let block_data: Vec<u8> = self
             .file
             .read(offset as u64, (offset_end - offset) as u64)?;
-        let block_data = &block_data[..block_len];
-
+        let checksum = (&block_data.as_slice()[block_len - 4..]).get_u32();
+        let block_data = &block_data[..block_len - 4];
+        let actual_checksum = crc32fast::hash(block_data);
+        if checksum != actual_checksum {
+            bail!("block checksum mismatched");
+        }
         Ok(Arc::new(Block::decode(block_data)))
     }
 
