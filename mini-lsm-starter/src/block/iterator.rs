@@ -43,15 +43,17 @@ impl Block {
         buf.get_u16();
         let key_len = buf.get_u16();
         let key = &buf[..key_len as usize];
-        KeyVec::from_vec(key.to_vec())
+        buf.advance(key_len as usize);
+        let time_stamp = buf.get_u64();
+        KeyVec::from_vec_with_ts(key.to_vec(), time_stamp)
     }
-    pub fn get_last_key(&self) -> KeyVec {
-        let last_key_offset = *self.offsets.last().unwrap();
-        let mut buf = &self.data[last_key_offset as usize..];
-        let key_len = buf.get_u16();
-        let key = &buf[..key_len as usize];
-        KeyVec::from_vec(key.to_vec())
-    }
+    // pub fn get_last_key(&self) -> KeyVec {
+    //     let last_key_offset = *self.offsets.last().unwrap();
+    //     let mut buf = &self.data[last_key_offset as usize..];
+    //     let key_len = buf.get_u16();
+    //     let key = &buf[..key_len as usize];
+    //     KeyVec::from_vec(key.to_vec())
+    // }
 }
 
 impl BlockIterator {
@@ -71,13 +73,17 @@ impl BlockIterator {
         let rest_key_len = buf.get_u16() as usize;
         let rest_key = &buf[..rest_key_len];
 
+        // get the key from the offset.
         self.key.clear();
-        self.key.append(&self.first_key.raw_ref()[..overlap_len]);
+        self.key.append(&self.first_key.key_ref()[..overlap_len]);
         self.key.append(rest_key);
         buf.advance(rest_key_len);
+        let time_stamp = buf.get_u64();
+        self.key.set_ts(time_stamp);
 
         let value_len = buf.get_u16() as usize;
-        let value_offset_begin = offset + 2 + 2 + rest_key_len + 2;
+        // overlap_len (u16) + remaining_key_len (u16) + len(rest_key) + time_stamp (u64) + value_len (u16)
+        let value_offset_begin = offset + 2 + 2 + rest_key_len + 8 + 2;
         let value_offset_end = value_offset_begin + value_len;
         self.value_range = (value_offset_begin, value_offset_end);
         buf.advance(value_len);
