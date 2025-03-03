@@ -18,13 +18,13 @@
 use std::ops::Bound;
 
 use anyhow::{bail, Result};
-use bytes::Bytes;
 
 use crate::{
     iterators::{
         concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
         two_merge_iterator::TwoMergeIterator, StorageIterator,
     },
+    key::KeyBytes,
     mem_table::MemTableIterator,
     table::SsTableIterator,
 };
@@ -37,12 +37,12 @@ type LsmIteratorInner = TwoMergeIterator<
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
-    end_bound: Bound<Bytes>,
+    end_bound: Bound<KeyBytes>,
     is_valid: bool,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<KeyBytes>) -> Result<Self> {
         let mut iter = Self {
             is_valid: iter.is_valid(),
             inner: iter,
@@ -60,8 +60,8 @@ impl LsmIterator {
         }
         match self.end_bound.as_ref() {
             Bound::Unbounded => {}
-            Bound::Included(key) => self.is_valid = self.inner.key().raw_ref() <= key.as_ref(),
-            Bound::Excluded(key) => self.is_valid = self.inner.key().raw_ref() < key.as_ref(),
+            Bound::Included(key) => self.is_valid = self.inner.key() <= key.as_key_slice(),
+            Bound::Excluded(key) => self.is_valid = self.inner.key() < key.as_key_slice(),
         }
         Ok(())
     }
@@ -82,7 +82,7 @@ impl StorageIterator for LsmIterator {
     }
 
     fn key(&self) -> &[u8] {
-        &self.inner.key().raw_ref()
+        &self.inner.key().key_ref()
     }
 
     fn value(&self) -> &[u8] {
