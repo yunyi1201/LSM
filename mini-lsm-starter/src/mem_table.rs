@@ -43,10 +43,18 @@ pub struct MemTable {
 }
 
 /// Create a bound of `Bytes` from a bound of `&KeySlice`.
-pub(crate) fn map_bound(bound: Bound<KeySlice>) -> Bound<KeyBytes> {
+pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
     match bound {
-        Bound::Included(x) => Bound::Included(x.to_key_vec().into_key_bytes()),
-        Bound::Excluded(x) => Bound::Excluded(x.to_key_vec().into_key_bytes()),
+        Bound::Included(x) => Bound::Included(Bytes::copy_from_slice(x)),
+        Bound::Excluded(x) => Bound::Excluded(Bytes::copy_from_slice(x)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+/// Create a bound of `Bytes` from a bound of `KeySlice`.
+pub(crate) fn map_key_bound_plus_ts(bound: Bound<&[u8]>, ts: u64) -> Bound<KeySlice> {
+    match bound {
+        Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, ts)),
+        Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, ts)),
         Bound::Unbounded => Bound::Unbounded,
     }
 }
@@ -145,10 +153,14 @@ impl MemTable {
 
     /// Get an iterator over a range of keys.
     pub fn scan(&self, lower: Bound<KeySlice>, upper: Bound<KeySlice>) -> MemTableIterator {
-        let (lower_bound, upper_bound) = (map_bound(lower), map_bound(upper));
         let mut iter = MemTableIteratorBuilder {
             map: self.map.clone(),
-            iter_builder: |map| map.range((lower_bound, upper_bound)),
+            iter_builder: |map| {
+                map.range((
+                    lower.map(|x| x.to_key_vec().into_key_bytes()),
+                    upper.map(|x| x.to_key_vec().into_key_bytes()),
+                ))
+            },
             item: (
                 KeyBytes::from_bytes_with_ts(Bytes::from_static(&[]), TS_DEFAULT),
                 Bytes::from_static(&[]),

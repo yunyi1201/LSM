@@ -18,13 +18,14 @@
 use std::ops::Bound;
 
 use anyhow::{bail, Result};
+use bytes::Bytes;
 
 use crate::{
     iterators::{
         concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
         two_merge_iterator::TwoMergeIterator, StorageIterator,
     },
-    key::KeyBytes,
+    key::{KeyBytes, KeySlice},
     mem_table::MemTableIterator,
     table::SsTableIterator,
 };
@@ -37,15 +38,17 @@ type LsmIteratorInner = TwoMergeIterator<
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
-    end_bound: Bound<KeyBytes>,
+    end_bound: Bound<Bytes>,
+    prev_key: Vec<u8>,
     is_valid: bool,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<KeyBytes>) -> Result<Self> {
+    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
         let mut iter = Self {
             is_valid: iter.is_valid(),
             inner: iter,
+            prev_key: vec![],
             end_bound,
         };
         iter.move_to_non_delete()?;
@@ -53,15 +56,20 @@ impl LsmIterator {
     }
 
     fn next_inner(&mut self) -> Result<()> {
+        self.prev_key = self.key().to_vec();
         self.inner.next()?;
+        while self.inner.is_valid() && self.prev_key.as_slice() == self.key() {
+            self.inner.next()?;
+        }
+
         if !self.inner.is_valid() {
             self.is_valid = false;
             return Ok(());
         }
         match self.end_bound.as_ref() {
             Bound::Unbounded => {}
-            Bound::Included(key) => self.is_valid = self.inner.key() <= key.as_key_slice(),
-            Bound::Excluded(key) => self.is_valid = self.inner.key() < key.as_key_slice(),
+            Bound::Included(key) => self.is_valid = self.inner.key().key_ref() <= key,
+            Bound::Excluded(key) => self.is_valid = self.inner.key().key_ref() < key,
         }
         Ok(())
     }
